@@ -1,0 +1,981 @@
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
+
+local player    = Players.LocalPlayer
+local mouse     = player:GetMouse()
+local playerGui = player.PlayerGui
+
+local function getToggleFolder()
+	local f = playerGui:FindFirstChild("BuildingToolsState")
+	if not f then
+		f = Instance.new("Folder")
+		f.Name   = "BuildingToolsState"
+		f.Parent = playerGui
+	end
+	return f
+end
+local toggleFolder = getToggleFolder()
+
+local function isEnabled() return toggleFolder:FindFirstChild("Enabled") ~= nil end
+local function setEnabled(v)
+	if v then
+		if not toggleFolder:FindFirstChild("Enabled") then
+			local t = Instance.new("BoolValue")
+			t.Name   = "Enabled"
+			t.Parent = toggleFolder
+		end
+	else
+		local t = toggleFolder:FindFirstChild("Enabled")
+		if t then t:Destroy() end
+	end
+end
+
+local PANEL_W = 230
+local PANEL_H = 318
+
+local AXIS_COLORS = {
+	Up    = BrickColor.new("Bright blue"),
+	Down  = BrickColor.new("Bright blue"),
+	Left  = BrickColor.new("Bright red"),
+	Right = BrickColor.new("Bright red"),
+	Front = BrickColor.new("Lime green"),
+	Back  = BrickColor.new("Lime green"),
+}
+local HOVER_COLOR = BrickColor.new("Bright yellow")
+local ORB_OFFSET  = 3.5
+
+local DIRECTIONS = {
+	Up    = Vector3.new( 0,  1,  0),
+	Down  = Vector3.new( 0, -1,  0),
+	Right = Vector3.new( 1,  0,  0),
+	Left  = Vector3.new(-1,  0,  0),
+	Front = Vector3.new( 0,  0, -1),
+	Back  = Vector3.new( 0,  0,  1),
+}
+
+local SHAPES = {
+	{ name = "Cube",        size = Vector3.new(4,   4,   4) },
+	{ name = "Flat Square", size = Vector3.new(4,   0.5, 4) },
+	{ name = "Rectangle",   size = Vector3.new(8,   2,   4) },
+	{ name = "Tall Block",  size = Vector3.new(3,   8,   3) },
+	{ name = "Slab",        size = Vector3.new(10,  1,   5) },
+	{ name = "Bridge",      size = Vector3.new(12,  0.5, 3) },
+}
+
+local TOOL_NAMES = { "Move", "Delete", "Create", "Reset", "Scale" }
+
+local function isProtected(part)
+	if not part or not part:IsA("BasePart") then return true end
+	if part.ClassName == "Terrain"          then return true end
+	if part:IsDescendantOf(playerGui)       then return true end
+	local char = player.Character
+	if char and part:IsDescendantOf(char)   then return true end
+	return false
+end
+
+local function makeHandle(tool)
+	local h = Instance.new("Part")
+	h.Name         = "Handle"
+	h.Size         = Vector3.new(0.1, 0.1, 0.1)
+	h.Transparency = 1
+	h.CanCollide   = false
+	h.Massless     = true
+	h.Parent       = tool
+end
+
+local handleFolder = nil
+local selectionBox = nil
+local targetPart   = nil
+local activeOrb    = nil
+local hoveredOrb   = nil
+local dragConn     = nil
+local dragUpConn   = nil
+local wasAnchored  = false
+
+local function setOrbColor(orb, color)
+	if orb and orb.Parent then orb.BrickColor = color end
+end
+
+local function clearHandles()
+	if handleFolder then handleFolder:Destroy(); handleFolder = nil end
+	if selectionBox then selectionBox:Destroy(); selectionBox = nil end
+	activeOrb  = nil
+	hoveredOrb = nil
+end
+
+local function stopDrag()
+	if dragConn   then dragConn:Disconnect();   dragConn   = nil end
+	if dragUpConn then dragUpConn:Disconnect(); dragUpConn = nil end
+	activeOrb = nil
+end
+
+local function updateOrbPositions()
+	if not handleFolder or not targetPart or not targetPart:IsA("BasePart") then return end
+	local size = targetPart.Size
+	local pos  = targetPart.Position
+	for _, orb in ipairs(handleFolder:GetChildren()) do
+		if orb:IsA("BasePart") then
+			local dir = DIRECTIONS[orb.Name]
+			if dir then
+				local half = math.abs(dir.X)*size.X*0.5
+				           + math.abs(dir.Y)*size.Y*0.5
+				           + math.abs(dir.Z)*size.Z*0.5
+				orb.CFrame = CFrame.new(pos + dir*(half + ORB_OFFSET))
+			end
+		end
+	end
+end
+
+local function spawnHandles(part)
+	clearHandles()
+	targetPart   = part
+	handleFolder = Instance.new("Folder")
+	handleFolder.Name   = "BuildMoveHandles"
+	handleFolder.Parent = workspace
+
+	for dirName in pairs(DIRECTIONS) do
+		local orb = Instance.new("Part")
+		orb.Name       = dirName
+		orb.Shape      = Enum.PartType.Ball
+		orb.Size       = Vector3.new(1.2, 1.2, 1.2)
+		orb.Material   = Enum.Material.Neon
+		orb.BrickColor = AXIS_COLORS[dirName]
+		orb.Anchored   = true
+		orb.CanCollide = false
+		orb.CastShadow = false
+		orb.Parent     = handleFolder
+	end
+
+	selectionBox = Instance.new("SelectionBox")
+	selectionBox.Adornee             = part
+	selectionBox.Color3              = Color3.fromRGB(255, 200, 0)
+	selectionBox.LineThickness       = 0.05
+	selectionBox.SurfaceTransparency = 0.8
+	selectionBox.SurfaceColor3       = Color3.fromRGB(255, 200, 0)
+	selectionBox.Parent              = workspace
+
+	updateOrbPositions()
+end
+
+local function beginOrbDrag(orb)
+	local dirName = orb.Name
+	local dir     = DIRECTIONS[dirName]
+	if not dir or not targetPart then return end
+
+	activeOrb           = orb
+	wasAnchored         = targetPart.Anchored
+	targetPart.Anchored = true
+
+	local startPos  = targetPart.Position
+	local camera    = workspace.CurrentCamera
+	local camFwd    = -camera.CFrame.LookVector
+	local planeNorm = dir:Cross(camFwd)
+	if planeNorm.Magnitude < 0.001 then planeNorm = dir:Cross(camera.CFrame.RightVector) end
+	planeNorm       = planeNorm.Unit
+	local dragPlane = planeNorm:Cross(dir).Unit
+
+	local ray0  = camera:ScreenPointToRay(mouse.X, mouse.Y)
+	local den0  = dragPlane:Dot(ray0.Direction)
+	local t0    = math.abs(den0) > 0.0001 and dragPlane:Dot(startPos - ray0.Origin)/den0 or 0
+	local hit0  = ray0.Origin + ray0.Direction*t0
+
+	dragConn = RunService.RenderStepped:Connect(function()
+		if not targetPart or not targetPart:IsA("BasePart") then return end
+		local cam = workspace.CurrentCamera
+		local ray = cam:ScreenPointToRay(mouse.X, mouse.Y)
+		local den = dragPlane:Dot(ray.Direction)
+		if math.abs(den) < 0.0001 then return end
+		local t   = dragPlane:Dot(startPos - ray.Origin)/den
+		local hit = ray.Origin + ray.Direction*t
+		local mov = dir * dir:Dot(hit - hit0)
+		targetPart.CFrame = CFrame.new(startPos + mov) * (targetPart.CFrame - targetPart.CFrame.Position)
+		updateOrbPositions()
+	end)
+
+	dragUpConn = UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			stopDrag()
+			if targetPart and targetPart:IsA("BasePart") then
+				if not wasAnchored then targetPart.Anchored = false end
+			end
+			setOrbColor(orb, AXIS_COLORS[dirName])
+		end
+	end)
+end
+
+local createGui     = nil
+local selectedShape = SHAPES[1]
+local savedPanelPos = nil
+local snapEnabled   = true
+local createdParts  = {}
+
+local function spawnPart(finalPos, shapeData)
+	local part = Instance.new("Part")
+	part.Anchored    = true
+	part.Material    = Enum.Material.SmoothPlastic
+	part.BrickColor  = BrickColor.new("Medium stone grey")
+	part.Size        = shapeData.size
+	part.CFrame      = CFrame.new(finalPos + Vector3.new(0, 15, 0))
+	part.Transparency = 0
+	part.CanCollide  = false
+	part.Parent      = workspace
+	
+	-- Add tag to track created parts
+	part.Name = "BuildToolPart"
+	table.insert(createdParts, part)
+
+	local tweenDrop = TweenService:Create(part,
+		TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		CFrame = CFrame.new(finalPos),
+	})
+
+	tweenDrop:Play()
+
+	tweenDrop.Completed:Connect(function()
+		part.CanCollide = true
+	end)
+end
+
+local function tryFindSnapPosition(shapeData)
+	if not snapEnabled then return nil end
+	
+	local camera = workspace.CurrentCamera
+	local char = player.Character
+
+	local function isCandidate(p)
+		if not p or not p:IsA("BasePart") then return false end
+		if p.ClassName == "Terrain" then return false end
+		if p:IsDescendantOf(playerGui) then return false end
+		if char and p:IsDescendantOf(char) then return false end
+		if handleFolder and p:IsDescendantOf(handleFolder) then return false end
+		return true
+	end
+
+	-- Cast a ray from the camera through the mouse position
+	local ray = camera:ScreenPointToRay(mouse.X, mouse.Y)
+	local rayOrigin = ray.Origin
+	local rayDir = ray.Direction * 1000
+
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+	local filterList = {camera}
+	if char then table.insert(filterList, char) end
+	if handleFolder then table.insert(filterList, handleFolder) end
+	rayParams.FilterDescendantsInstances = filterList
+
+	local result = workspace:Raycast(rayOrigin, rayDir, rayParams)
+	
+	if result and result.Instance and isCandidate(result.Instance) then
+		local hitPart = result.Instance
+		local hitPos = result.Position
+		local normal = result.Normal
+		
+		-- Snap the normal to nearest axis for perfect alignment
+		local absX, absY, absZ = math.abs(normal.X), math.abs(normal.Y), math.abs(normal.Z)
+		if absX > absY and absX > absZ then
+			normal = Vector3.new(normal.X > 0 and 1 or -1, 0, 0)
+		elseif absY > absX and absY > absZ then
+			normal = Vector3.new(0, normal.Y > 0 and 1 or -1, 0)
+		else
+			normal = Vector3.new(0, 0, normal.Z > 0 and 1 or -1)
+		end
+		
+		-- Calculate half extents for both parts
+		local hitHalfSize = hitPart.Size * 0.5
+		local newHalfSize = shapeData.size * 0.5
+		
+		-- Calculate distance from hit part center to its surface along normal
+		local hitSurfaceDist = math.abs(normal.X) * hitHalfSize.X
+		                     + math.abs(normal.Y) * hitHalfSize.Y
+		                     + math.abs(normal.Z) * hitHalfSize.Z
+		
+		-- Calculate distance from new part center to its surface along normal
+		local newSurfaceDist = math.abs(normal.X) * newHalfSize.X
+		                     + math.abs(normal.Y) * newHalfSize.Y
+		                     + math.abs(normal.Z) * newHalfSize.Z
+		
+		-- Calculate the final snapped position
+		local snapPos = hitPart.Position + normal * (hitSurfaceDist + newSurfaceDist)
+		
+		-- Also align on the other axes for perfect grid snapping
+		local hitCF = hitPart.CFrame
+		local localHit = hitCF:PointToObjectSpace(hitPos)
+		
+		-- Align X axis
+		if math.abs(normal.X) < 0.5 then
+			local gridX = math.floor((localHit.X / shapeData.size.X) + 0.5) * shapeData.size.X
+			snapPos = snapPos + hitCF.RightVector * (gridX - (hitCF:PointToObjectSpace(snapPos).X))
+		end
+		
+		-- Align Y axis  
+		if math.abs(normal.Y) < 0.5 then
+			local gridY = math.floor((localHit.Y / shapeData.size.Y) + 0.5) * shapeData.size.Y
+			snapPos = snapPos + hitCF.UpVector * (gridY - (hitCF:PointToObjectSpace(snapPos).Y))
+		end
+		
+		-- Align Z axis
+		if math.abs(normal.Z) < 0.5 then
+			local gridZ = math.floor((localHit.Z / shapeData.size.Z) + 0.5) * shapeData.size.Z
+			snapPos = snapPos + hitCF.LookVector * (gridZ - (hitCF:PointToObjectSpace(snapPos).Z))
+		end
+		
+		return snapPos
+	end
+
+	return nil
+end
+
+local function trySmartSnapPosition(shapeData, targetPos)
+	if not snapEnabled then return targetPos end
+	
+	-- Check if placing at targetPos would be touching any created parts
+	-- If so, snap it perfectly to align with that part
+	
+	local newHalfSize = shapeData.size * 0.5
+	
+	for _, part in ipairs(createdParts) do
+		if part and part.Parent then
+			local partHalfSize = part.Size * 0.5
+			local delta = targetPos - part.Position
+			
+			-- Check each axis to see if we're close enough to snap
+			local snapDelta = Vector3.new(0, 0, 0)
+			local didSnap = false
+			
+			-- Check X axis
+			local xDist = math.abs(delta.X) - (partHalfSize.X + newHalfSize.X)
+			if math.abs(xDist) < 2 then
+				-- We're close on X axis, snap to it
+				local snapX = part.Position.X + (delta.X > 0 and 1 or -1) * (partHalfSize.X + newHalfSize.X)
+				snapDelta = Vector3.new(snapX - targetPos.X, snapDelta.Y, snapDelta.Z)
+				didSnap = true
+			end
+			
+			-- Check Y axis
+			local yDist = math.abs(delta.Y) - (partHalfSize.Y + newHalfSize.Y)
+			if math.abs(yDist) < 2 then
+				-- We're close on Y axis, snap to it
+				local snapY = part.Position.Y + (delta.Y > 0 and 1 or -1) * (partHalfSize.Y + newHalfSize.Y)
+				snapDelta = Vector3.new(snapDelta.X, snapY - targetPos.Y, snapDelta.Z)
+				didSnap = true
+			end
+			
+			-- Check Z axis
+			local zDist = math.abs(delta.Z) - (partHalfSize.Z + newHalfSize.Z)
+			if math.abs(zDist) < 2 then
+				-- We're close on Z axis, snap to it
+				local snapZ = part.Position.Z + (delta.Z > 0 and 1 or -1) * (partHalfSize.Z + newHalfSize.Z)
+				snapDelta = Vector3.new(snapDelta.X, snapDelta.Y, snapZ - targetPos.Z)
+				didSnap = true
+			end
+			
+			-- If we snapped, return the snapped position
+			if didSnap then
+				return targetPos + snapDelta
+			end
+		end
+	end
+	
+	-- No snap needed, return original position
+	return targetPos
+end
+
+local function buildCreateGui()
+	if createGui then createGui:Destroy() end
+
+	local sg = Instance.new("ScreenGui")
+	sg.Name           = "CreateToolUI"
+	sg.ResetOnSpawn   = false
+	sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	sg.Parent         = playerGui
+	createGui         = sg
+
+	local viewSize = workspace.CurrentCamera.ViewportSize
+	local defaultX = viewSize.X - PANEL_W - 20
+	local defaultY = (viewSize.Y - PANEL_H) / 2
+
+	local panel = Instance.new("Frame")
+	panel.Size             = UDim2.new(0, PANEL_W, 0, PANEL_H)
+	panel.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+	panel.BorderSizePixel  = 0
+	panel.ClipsDescendants = false
+	panel.Parent           = sg
+
+	if savedPanelPos then
+		panel.Position = savedPanelPos
+	else
+		panel.Position = UDim2.new(0, defaultX + PANEL_W + 40, 0, defaultY)
+	end
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 8)
+	corner.Parent       = panel
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color     = Color3.fromRGB(60, 60, 60)
+	stroke.Thickness = 1
+	stroke.Parent    = panel
+
+	local titleLabel = Instance.new("TextLabel")
+	titleLabel.Size                 = UDim2.new(0.5, -8, 0, 32)
+	titleLabel.Position             = UDim2.new(0, 16, 0, 8)
+	titleLabel.BackgroundTransparency = 1
+	titleLabel.Text                 = "CREATE"
+	titleLabel.TextColor3           = Color3.fromRGB(200, 200, 200)
+	titleLabel.Font                 = Enum.Font.GothamBold
+	titleLabel.TextSize             = 14
+	titleLabel.TextXAlignment       = Enum.TextXAlignment.Left
+	titleLabel.Parent               = panel
+
+	-- Snap toggle button
+	local snapToggle = Instance.new("TextButton")
+	snapToggle.Size             = UDim2.new(0, 70, 0, 24)
+	snapToggle.Position         = UDim2.new(1, -82, 0, 12)
+	snapToggle.BackgroundColor3 = snapEnabled and Color3.fromRGB(60, 60, 60) or Color3.fromRGB(40, 40, 40)
+	snapToggle.Text             = snapEnabled and "SNAP ON" or "SNAP OFF"
+	snapToggle.TextColor3       = snapEnabled and Color3.fromRGB(200, 200, 200) or Color3.fromRGB(120, 120, 120)
+	snapToggle.Font             = Enum.Font.GothamBold
+	snapToggle.TextSize         = 9
+	snapToggle.AutoButtonColor  = false
+	snapToggle.ZIndex           = 11
+	snapToggle.Parent           = panel
+
+	local snapCorner = Instance.new("UICorner")
+	snapCorner.CornerRadius = UDim.new(0, 4)
+	snapCorner.Parent       = snapToggle
+
+	snapToggle.MouseButton1Click:Connect(function()
+		snapEnabled = not snapEnabled
+		TweenService:Create(snapToggle, TweenInfo.new(0.15), {
+			BackgroundColor3 = snapEnabled and Color3.fromRGB(60, 60, 60) or Color3.fromRGB(40, 40, 40),
+			TextColor3 = snapEnabled and Color3.fromRGB(200, 200, 200) or Color3.fromRGB(120, 120, 120)
+		}):Play()
+		snapToggle.Text = snapEnabled and "SNAP ON" or "SNAP OFF"
+	end)
+
+	local divider = Instance.new("Frame")
+	divider.Size             = UDim2.new(1, -24, 0, 1)
+	divider.Position         = UDim2.new(0, 12, 0, 44)
+	divider.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+	divider.BorderSizePixel  = 0
+	divider.Parent           = panel
+
+	local scrollFrame = Instance.new("ScrollingFrame")
+	scrollFrame.Size                = UDim2.new(1, -24, 0, PANEL_H - 58)
+	scrollFrame.Position            = UDim2.new(0, 12, 0, 50)
+	scrollFrame.BackgroundTransparency = 1
+	scrollFrame.BorderSizePixel     = 0
+	scrollFrame.ScrollBarThickness  = 4
+	scrollFrame.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 100)
+	scrollFrame.ScrollingDirection  = Enum.ScrollingDirection.Y
+	scrollFrame.CanvasSize          = UDim2.new(0, 0, 0, 0)
+	scrollFrame.ClipsDescendants    = true
+	scrollFrame.Parent              = panel
+
+	local listLayout = Instance.new("UIListLayout")
+	listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	listLayout.Padding   = UDim.new(0, 4)
+	listLayout.Parent    = scrollFrame
+
+	listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		scrollFrame.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 4)
+	end)
+
+	local allBtns = {}
+
+	local function refreshButtons()
+		for shape, btn in pairs(allBtns) do
+			local isSelected = (shape == selectedShape)
+			TweenService:Create(btn, TweenInfo.new(0.15), {
+				BackgroundColor3 = isSelected
+					and Color3.fromRGB(80, 80, 80)
+					or  Color3.fromRGB(35, 35, 35),
+			}):Play()
+		end
+	end
+
+	for i, shape in ipairs(SHAPES) do
+		local btn = Instance.new("TextButton")
+		btn.Size             = UDim2.new(1, 0, 0, 32)
+		btn.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+		btn.TextColor3       = Color3.fromRGB(200, 200, 200)
+		btn.Font             = Enum.Font.Gotham
+		btn.TextSize         = 12
+		btn.Text             = ""
+		btn.AutoButtonColor  = false
+		btn.LayoutOrder      = i
+		btn.Parent           = scrollFrame
+
+		local btnCorner = Instance.new("UICorner")
+		btnCorner.CornerRadius = UDim.new(0, 4)
+		btnCorner.Parent       = btn
+
+		local nameLabel = Instance.new("TextLabel")
+		nameLabel.Size                 = UDim2.new(0.6, 0, 1, 0)
+		nameLabel.Position             = UDim2.new(0, 12, 0, 0)
+		nameLabel.BackgroundTransparency = 1
+		nameLabel.Text                 = shape.name
+		nameLabel.TextColor3           = Color3.fromRGB(200, 200, 200)
+		nameLabel.Font                 = Enum.Font.Gotham
+		nameLabel.TextSize             = 12
+		nameLabel.TextXAlignment       = Enum.TextXAlignment.Left
+		nameLabel.Parent               = btn
+
+		local sizeLabel = Instance.new("TextLabel")
+		sizeLabel.Size                 = UDim2.new(0.4, -12, 1, 0)
+		sizeLabel.Position             = UDim2.new(0.6, 0, 0, 0)
+		sizeLabel.BackgroundTransparency = 1
+		sizeLabel.Text                 = shape.size.X .. "×" .. shape.size.Y .. "×" .. shape.size.Z
+		sizeLabel.TextColor3           = Color3.fromRGB(120, 120, 120)
+		sizeLabel.Font                 = Enum.Font.Gotham
+		sizeLabel.TextSize             = 10
+		sizeLabel.TextXAlignment       = Enum.TextXAlignment.Right
+		sizeLabel.Parent               = btn
+
+		allBtns[shape] = btn
+
+		btn.MouseButton1Click:Connect(function()
+			selectedShape = shape
+			refreshButtons()
+		end)
+
+		btn.MouseEnter:Connect(function()
+			if shape ~= selectedShape then
+				TweenService:Create(btn, TweenInfo.new(0.1), {
+					BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+				}):Play()
+			end
+		end)
+		btn.MouseLeave:Connect(function()
+			if shape ~= selectedShape then
+				TweenService:Create(btn, TweenInfo.new(0.1), {
+					BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+				}):Play()
+			end
+		end)
+	end
+
+	refreshButtons()
+
+	local dragging    = false
+	local dragOffsetX = 0
+	local dragOffsetY = 0
+
+	local dragHandle = Instance.new("TextButton")
+	dragHandle.Size                 = UDim2.new(1, 0, 0, 44)
+	dragHandle.Position             = UDim2.new(0, 0, 0, 0)
+	dragHandle.BackgroundTransparency = 1
+	dragHandle.Text                 = ""
+	dragHandle.ZIndex               = 10
+	dragHandle.Parent               = panel
+
+	dragHandle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging    = true
+			dragOffsetX = input.Position.X - panel.AbsolutePosition.X
+			dragOffsetY = input.Position.Y - panel.AbsolutePosition.Y
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+			local newX = input.Position.X - dragOffsetX
+			local newY = input.Position.Y - dragOffsetY
+			local vp   = workspace.CurrentCamera.ViewportSize
+			newX = math.clamp(newX, 0, vp.X - PANEL_W)
+			newY = math.clamp(newY, 0, vp.Y - PANEL_H)
+			panel.Position  = UDim2.new(0, newX, 0, newY)
+			savedPanelPos   = panel.Position
+		end
+	end)
+
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = false
+		end
+	end)
+
+	local targetX = savedPanelPos and savedPanelPos.X.Offset or defaultX
+	local targetY = savedPanelPos and savedPanelPos.Y.Offset or defaultY
+
+	panel.Position = UDim2.new(0, targetX + PANEL_W + 30, 0, targetY)
+	TweenService:Create(panel,
+		TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Position = UDim2.new(0, targetX, 0, targetY)
+	}):Play()
+end
+
+local function destroyCreateGui()
+	if not createGui then return end
+	local panel = createGui:FindFirstChildOfClass("Frame")
+	if panel then
+		local exitX = panel.AbsolutePosition.X + PANEL_W + 30
+		local exitY = panel.AbsolutePosition.Y
+		local tween = TweenService:Create(panel,
+			TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+			Position = UDim2.new(0, exitX, 0, exitY)
+		})
+		tween:Play()
+		tween.Completed:Connect(function()
+			if createGui then createGui:Destroy(); createGui = nil end
+		end)
+	else
+		createGui:Destroy()
+		createGui = nil
+	end
+end
+
+local function createMoveTool()
+	local tool = Instance.new("Tool")
+	tool.Name           = "Move"
+	tool.RequiresHandle = false
+	tool.CanBeDropped   = false
+	makeHandle(tool)
+
+	local renderConn
+
+	tool.Equipped:Connect(function()
+		mouse.Icon = "rbxasset://textures/ArrowCursor.png"
+		renderConn = RunService.RenderStepped:Connect(function()
+			updateOrbPositions()
+			local tgt = mouse.Target
+			if hoveredOrb and hoveredOrb ~= activeOrb then
+				setOrbColor(hoveredOrb, AXIS_COLORS[hoveredOrb.Name])
+				hoveredOrb = nil
+			end
+			if tgt and handleFolder and tgt:IsDescendantOf(handleFolder) then
+				hoveredOrb = tgt
+				if hoveredOrb ~= activeOrb then setOrbColor(hoveredOrb, HOVER_COLOR) end
+			end
+		end)
+	end)
+
+	tool.Unequipped:Connect(function()
+		if renderConn then renderConn:Disconnect(); renderConn = nil end
+		stopDrag()
+		clearHandles()
+		targetPart = nil
+		mouse.Icon = ""
+	end)
+
+	tool.Activated:Connect(function()
+		local tgt = mouse.Target
+		if not tgt then return end
+		if handleFolder and tgt:IsDescendantOf(handleFolder) then
+			beginOrbDrag(tgt); return
+		end
+		if isProtected(tgt) then return end
+		spawnHandles(tgt)
+	end)
+
+	return tool
+end
+
+local function createDeleteTool()
+	local tool = Instance.new("Tool")
+	tool.Name           = "Delete"
+	tool.RequiresHandle = false
+	tool.CanBeDropped   = false
+	makeHandle(tool)
+
+	tool.Equipped:Connect(function()
+		mouse.Icon = "rbxasset://textures/Cursors/Rotate.png"
+	end)
+	tool.Unequipped:Connect(function()
+		mouse.Icon = ""
+	end)
+	tool.Activated:Connect(function()
+		local tgt = mouse.Target
+		if isProtected(tgt) then return end
+		if tgt == targetPart then clearHandles(); targetPart = nil end
+		tgt:Destroy()
+	end)
+
+	return tool
+end
+
+local function createCreateTool()
+	local tool = Instance.new("Tool")
+	tool.Name           = "Create"
+	tool.RequiresHandle = false
+	tool.CanBeDropped   = false
+	makeHandle(tool)
+
+	tool.Equipped:Connect(function()
+		mouse.Icon = "rbxasset://textures/Cursors/Rotate.png"
+		buildCreateGui()
+	end)
+
+	tool.Unequipped:Connect(function()
+		mouse.Icon = ""
+		destroyCreateGui()
+	end)
+
+	tool.Activated:Connect(function()
+		local tgt = mouse.Target
+
+		if tgt and tgt:IsDescendantOf(playerGui) then return end
+		local char = player.Character
+		if tgt and char and tgt:IsDescendantOf(char) then return end
+		if handleFolder and tgt and tgt:IsDescendantOf(handleFolder) then return end
+
+		-- First try to snap to a nearby part's surface (when clicking on a part)
+		local snapPos = tryFindSnapPosition(selectedShape)
+		if snapPos then
+			spawnPart(snapPos, selectedShape)
+			return
+		end
+
+		-- Otherwise place at mouse.Hit position and apply smart snap
+		if mouse.Hit then
+			local hitPos = mouse.Hit.Position
+			local placeY = hitPos.Y + selectedShape.size.Y * 0.5
+			local targetPos = Vector3.new(hitPos.X, placeY, hitPos.Z)
+			
+			-- Apply smart snap to align with created parts if we're close
+			local finalPos = trySmartSnapPosition(selectedShape, targetPos)
+			spawnPart(finalPos, selectedShape)
+		end
+	end)
+
+	return tool
+end
+
+local function createScaleTool()
+	local tool = Instance.new("Tool")
+	tool.Name           = "Scale"
+	tool.RequiresHandle = false
+	tool.CanBeDropped   = false
+	makeHandle(tool)
+
+	local renderConn
+	local scaleOrbActive = nil
+	local scaleConn = nil
+	local scaleUpConn = nil
+	local startSize = nil
+	local startCFrame = nil
+
+	local function beginOrbScale(orb)
+		local dirName = orb.Name
+		local dir     = DIRECTIONS[dirName]
+		if not dir or not targetPart then return end
+
+		scaleOrbActive = orb
+		startSize = targetPart.Size
+		startCFrame = targetPart.CFrame
+
+		local camera = workspace.CurrentCamera
+		local camFwd = -camera.CFrame.LookVector
+		local planeNorm = dir:Cross(camFwd)
+		if planeNorm.Magnitude < 0.001 then planeNorm = dir:Cross(camera.CFrame.RightVector) end
+		planeNorm = planeNorm.Unit
+		local scalePlane = planeNorm:Cross(dir).Unit
+
+		local startPos = targetPart.Position
+		local ray0 = camera:ScreenPointToRay(mouse.X, mouse.Y)
+		local den0 = scalePlane:Dot(ray0.Direction)
+		local t0 = math.abs(den0) > 0.0001 and scalePlane:Dot(startPos - ray0.Origin)/den0 or 0
+		local hit0 = ray0.Origin + ray0.Direction*t0
+
+		scaleConn = RunService.RenderStepped:Connect(function()
+			if not targetPart or not targetPart:IsA("BasePart") then return end
+			local cam = workspace.CurrentCamera
+			local ray = cam:ScreenPointToRay(mouse.X, mouse.Y)
+			local den = scalePlane:Dot(ray.Direction)
+			if math.abs(den) < 0.0001 then return end
+			local t = scalePlane:Dot(startPos - ray.Origin)/den
+			local hit = ray.Origin + ray.Direction*t
+			
+			-- Calculate the scale change in the direction of the orb
+			local movement = dir:Dot(hit - hit0)
+			
+			-- Apply scale change only in the direction we're dragging
+			local newSize = Vector3.new(
+				startSize.X + (math.abs(dir.X) > 0.5 and movement or 0),
+				startSize.Y + (math.abs(dir.Y) > 0.5 and movement or 0),
+				startSize.Z + (math.abs(dir.Z) > 0.5 and movement or 0)
+			)
+			
+			-- Prevent negative or too-small sizes
+			newSize = Vector3.new(
+				math.max(0.2, newSize.X),
+				math.max(0.2, newSize.Y),
+				math.max(0.2, newSize.Z)
+			)
+			
+			targetPart.Size = newSize
+			
+			-- Move the part so it scales in the direction of the orb
+			-- The center moves by half the size change in the orb's direction
+			local sizeChange = newSize - startSize
+			local posOffset = Vector3.new(
+				dir.X * sizeChange.X * 0.5,
+				dir.Y * sizeChange.Y * 0.5,
+				dir.Z * sizeChange.Z * 0.5
+			)
+			
+			targetPart.CFrame = CFrame.new(startCFrame.Position + posOffset) * (startCFrame - startCFrame.Position)
+			
+			updateOrbPositions()
+		end)
+
+		scaleUpConn = UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				if scaleConn then scaleConn:Disconnect(); scaleConn = nil end
+				if scaleUpConn then scaleUpConn:Disconnect(); scaleUpConn = nil end
+				scaleOrbActive = nil
+				setOrbColor(orb, AXIS_COLORS[dirName])
+			end
+		end)
+	end
+
+	tool.Equipped:Connect(function()
+		mouse.Icon = "rbxasset://textures/ArrowCursor.png"
+		renderConn = RunService.RenderStepped:Connect(function()
+			updateOrbPositions()
+			local tgt = mouse.Target
+			if hoveredOrb and hoveredOrb ~= scaleOrbActive then
+				setOrbColor(hoveredOrb, AXIS_COLORS[hoveredOrb.Name])
+				hoveredOrb = nil
+			end
+			if tgt and handleFolder and tgt:IsDescendantOf(handleFolder) then
+				hoveredOrb = tgt
+				if hoveredOrb ~= scaleOrbActive then setOrbColor(hoveredOrb, HOVER_COLOR) end
+			end
+		end)
+	end)
+
+	tool.Unequipped:Connect(function()
+		if renderConn then renderConn:Disconnect(); renderConn = nil end
+		if scaleConn then scaleConn:Disconnect(); scaleConn = nil end
+		if scaleUpConn then scaleUpConn:Disconnect(); scaleUpConn = nil end
+		scaleOrbActive = nil
+		clearHandles()
+		targetPart = nil
+		mouse.Icon = ""
+	end)
+
+	tool.Activated:Connect(function()
+		local tgt = mouse.Target
+		if not tgt then return end
+		if handleFolder and tgt:IsDescendantOf(handleFolder) then
+			beginOrbScale(tgt); return
+		end
+		if isProtected(tgt) then return end
+		spawnHandles(tgt)
+	end)
+
+	return tool
+end
+
+local function createResetTool()
+	local tool = Instance.new("Tool")
+	tool.Name           = "Reset"
+	tool.RequiresHandle = false
+	tool.CanBeDropped   = false
+	makeHandle(tool)
+
+	tool.Equipped:Connect(function()
+		mouse.Icon = "rbxasset://textures/Cursors/Rotate.png"
+	end)
+	
+	tool.Unequipped:Connect(function()
+		mouse.Icon = ""
+	end)
+	
+	tool.Activated:Connect(function()
+		-- Clear all created parts
+		for i = #createdParts, 1, -1 do
+			local part = createdParts[i]
+			if part and part.Parent then
+				part:Destroy()
+			end
+			table.remove(createdParts, i)
+		end
+		
+		-- Also clear any parts named BuildToolPart that might have been missed
+		for _, obj in ipairs(workspace:GetDescendants()) do
+			if obj:IsA("BasePart") and obj.Name == "BuildToolPart" then
+				obj:Destroy()
+			end
+		end
+		
+		print("Reset complete - all created parts removed")
+	end)
+
+	return tool
+end
+
+local function removeAllTools()
+	local names = {}
+	for _, n in ipairs(TOOL_NAMES) do names[n] = true end
+
+	local bp = player.Backpack
+	local toDestroy = {}
+	for _, item in ipairs(bp:GetChildren()) do
+		if names[item.Name] and item:IsA("Tool") then
+			table.insert(toDestroy, item)
+		end
+	end
+	local char = player.Character
+	if char then
+		for _, item in ipairs(char:GetChildren()) do
+			if names[item.Name] and item:IsA("Tool") then
+				table.insert(toDestroy, item)
+			end
+		end
+	end
+	for _, item in ipairs(toDestroy) do
+		item:Destroy()
+	end
+
+	stopDrag()
+	clearHandles()
+	destroyCreateGui()
+	targetPart = nil
+end
+
+local function giveTools()
+	removeAllTools()
+	local bp = player.Backpack
+	local moveTool = createMoveTool()
+	moveTool.Parent = bp
+	
+	local deleteTool = createDeleteTool()
+	deleteTool.Parent = bp
+	
+	local createTool = createCreateTool()
+	createTool.Parent = bp
+	
+	local scaleTool = createScaleTool()
+	scaleTool.Parent = bp
+	
+	local resetTool = createResetTool()
+	resetTool.Parent = bp
+end
+
+if isEnabled() then
+	setEnabled(false)
+	removeAllTools()
+else
+	setEnabled(true)
+	giveTools()
+end
+
+-- Keep tools through death
+player.CharacterAdded:Connect(function(character)
+	if not isEnabled() then return end
+	
+	-- Wait for character to fully load
+	if not character:FindFirstChild("Humanoid") then
+		character:WaitForChild("Humanoid")
+	end
+	
+	-- Small delay to ensure backpack is ready
+	task.wait(0.2)
+	
+	-- Give tools again
+	giveTools()
+end)
