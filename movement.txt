@@ -1,0 +1,404 @@
+-- Toggle system
+shared.CustomMovementActive = shared.CustomMovementActive or false
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+local animator = humanoid:WaitForChild("Animator")
+local rootPart = character:WaitForChild("HumanoidRootPart")
+local hrp = rootPart
+
+-- If active, disable everything
+if shared.CustomMovementActive then
+    -- Restore defaults
+    humanoid.WalkSpeed = 16
+    humanoid.JumpPower = 50
+    humanoid.HipHeight = 2
+    humanoid.AutoRotate = true
+
+    local animateScript = character:FindFirstChild("Animate")
+    if animateScript then
+        animateScript.Disabled = false
+    end
+
+    -- Stop all animations
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        track:Stop(0)
+    end
+
+    -- Disconnect saved connections
+    if shared.CustomMovementConnections then
+        for _, conn in pairs(shared.CustomMovementConnections) do
+            if conn and conn.Disconnect then
+                conn:Disconnect()
+            end
+        end
+    end
+
+    -- Remove custom footstep sound
+    for _, obj in ipairs(hrp:GetChildren()) do
+        if obj:IsA("Sound") and obj.Name == "CustomFootstepSound" then
+            obj:Destroy()
+        end
+    end
+
+    shared.CustomMovementActive = false
+    shared.CustomMovementConnections = nil
+    return
+end
+
+-- Toggle ON
+shared.CustomMovementActive = true
+
+-- Stats
+humanoid.WalkSpeed = 40
+humanoid.JumpPower = 60
+
+local DEFAULT_HIP_HEIGHT = humanoid.HipHeight
+local CROUCH_HIP_HEIGHT = DEFAULT_HIP_HEIGHT * 0.5
+
+-- Animations
+local function createAnim(id, priority, looped)
+    local anim = Instance.new("Animation")
+    anim.AnimationId = id
+    local track = animator:LoadAnimation(anim)
+    track.Priority = priority
+    track.Looped = looped
+    return anim, track
+end
+
+local idleAnim, idleTrack = createAnim("rbxassetid://117536405275968", Enum.AnimationPriority.Idle, true)
+local runAnim, runTrack = createAnim("rbxassetid://116881956670910", Enum.AnimationPriority.Movement, true)
+local jumpAnim, jumpTrack = createAnim("rbxassetid://10921308158", Enum.AnimationPriority.Action, true)
+local fallAnim, fallTrack = createAnim("rbxassetid://10921307241", Enum.AnimationPriority.Action, true)
+local doubleJumpAnim, doubleJumpTrack = createAnim("rbxassetid://100338104133740", Enum.AnimationPriority.Action2, false)
+local crouchIdleAnim, crouchIdleTrack = createAnim("rbxassetid://113780551991016", Enum.AnimationPriority.Action, true)
+local crouchWalkAnim, crouchWalkTrack = createAnim("rbxassetid://107078800928182", Enum.AnimationPriority.Action, true)
+local slideAnim, slideTrack = createAnim("rbxassetid://95046479206562", Enum.AnimationPriority.Action, false)
+
+slideTrack:Play()
+slideTrack:Stop()
+task.wait(0.2)
+
+-- Config
+local ANIM_SPEED = 3
+local SLIDE_DURATION = (slideTrack.Length > 0 and slideTrack.Length or 0.6) / ANIM_SPEED
+local SLIDE_SPEED = 120
+local SLIDE_COOLDOWN = 0.5
+local DOUBLE_JUMP_POWER = 60
+local AIR_BUFFER = 0.2
+local CROUCH_SPEED = 10
+local CROUCH_JUMP_POWER = 0
+
+local FOOTSTEP_INTERVAL_RUN = 0.35
+local FOOTSTEP_INTERVAL_CROUCH = 0.6
+local footstepTimer = 0
+
+-- Footstep sound
+local footstepSound = Instance.new("Sound")
+footstepSound.Name = "CustomFootstepSound"
+footstepSound.SoundId = "rbxassetid://REPLACE_WITH_YOUR_SOUND_ID"
+footstepSound.Volume = 0.5
+footstepSound.RollOffMaxDistance = 30
+footstepSound.Parent = hrp
+
+-- State
+local isSliding = false
+local isInAir = false
+local isFalling = false
+local isCrouching = false
+local canDoubleJump = false
+local hasDoubleJumped = false
+local airTime = 0
+local lastSlide = 0
+local slideConnection = nil
+local slideDirection = Vector3.zero
+
+-- Disable default Animate script
+local animateScript = character:FindFirstChild("Animate")
+if animateScript then
+    animateScript.Disabled = true
+end
+
+for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+    track:Stop(0)
+end
+idleTrack:Play(0)
+
+-- Functions
+local function stopAllGroundAnims(fade)
+    idleTrack:Stop(fade)
+    runTrack:Stop(fade)
+    crouchIdleTrack:Stop(fade)
+    crouchWalkTrack:Stop(fade)
+end
+
+local function enterCrouch()
+    isCrouching = true
+    humanoid.WalkSpeed = CROUCH_SPEED
+    humanoid.HipHeight = CROUCH_HIP_HEIGHT
+    humanoid.JumpPower = CROUCH_JUMP_POWER
+end
+
+local function exitCrouch()
+    isCrouching = false
+    humanoid.WalkSpeed = 40
+    humanoid.HipHeight = DEFAULT_HIP_HEIGHT
+    humanoid.JumpPower = 60
+end
+
+local function doDoubleJump()
+    if not canDoubleJump or hasDoubleJumped then return end
+    if isCrouching then return end
+
+    hasDoubleJumped = true
+    canDoubleJump = false
+
+    local vel = rootPart.AssemblyLinearVelocity
+    rootPart.AssemblyLinearVelocity = Vector3.new(vel.X, DOUBLE_JUMP_POWER, vel.Z)
+
+    jumpTrack:Stop(0.05)
+    fallTrack:Stop(0.05)
+    doubleJumpTrack:Play(0.05)
+    doubleJumpTrack:AdjustSpeed(4)
+
+    doubleJumpTrack.Stopped:Connect(function()
+        if humanoid.FloorMaterial == Enum.Material.Air then
+            fallTrack:Play(0.1)
+        end
+    end)
+end
+
+local function stopSlide()
+    if slideConnection then
+        slideConnection:Disconnect()
+        slideConnection = nil
+    end
+
+    local positionBeforeStop = rootPart.CFrame
+    slideTrack:Stop(0)
+    rootPart.CFrame = positionBeforeStop
+
+    isSliding = false
+    humanoid.WalkSpeed = isCrouching and CROUCH_SPEED or 40
+    humanoid.JumpPower = isCrouching and CROUCH_JUMP_POWER or 60
+    humanoid.AutoRotate = true
+
+    if humanoid.MoveDirection.Magnitude > 0 then
+        runTrack:Play(0.1)
+    else
+        idleTrack:Play(0.1)
+    end
+end
+
+local function startSlide()
+    local now = tick()
+    if isSliding or (now - lastSlide) < SLIDE_COOLDOWN then return end
+    if humanoid.MoveDirection == Vector3.zero then return end
+
+    isSliding = true
+    lastSlide = now
+    slideDirection = rootPart.CFrame.LookVector
+
+    humanoid.AutoRotate = false
+    humanoid.JumpPower = 0
+    humanoid.WalkSpeed = 0
+
+    stopAllGroundAnims(0)
+    rootPart.CFrame = CFrame.new(rootPart.Position, rootPart.Position + slideDirection)
+
+    slideTrack:Play(0)
+    slideTrack:AdjustSpeed(ANIM_SPEED)
+
+    local elapsed = 0
+    slideConnection = RunService.Heartbeat:Connect(function(dt)
+        elapsed = elapsed + dt
+        if elapsed >= SLIDE_DURATION then
+            stopSlide()
+            return
+        end
+
+        local progress = elapsed / SLIDE_DURATION
+        local currentSpeed = SLIDE_SPEED * (1 - progress)
+        local newPos = rootPart.Position + (slideDirection * currentSpeed * dt)
+        rootPart.CFrame = CFrame.new(newPos, newPos + slideDirection)
+    end)
+end
+
+-- Connections
+local connections = {}
+
+local heartbeatConn = RunService.Heartbeat:Connect(function(dt)
+    if isSliding then return end
+
+    local airborne = humanoid.FloorMaterial == Enum.Material.Air
+    local isMoving = humanoid.MoveDirection.Magnitude > 0
+    local velY = rootPart.AssemblyLinearVelocity.Y
+
+    if not airborne and isMoving then
+        footstepTimer = footstepTimer - dt
+        if footstepTimer <= 0 then
+            footstepSound:Play()
+            footstepTimer = isCrouching and FOOTSTEP_INTERVAL_CROUCH or FOOTSTEP_INTERVAL_RUN
+        end
+    else
+        footstepTimer = 0
+    end
+
+    if airborne then
+        airTime = airTime + dt
+        if airTime >= AIR_BUFFER and not hasDoubleJumped then
+            canDoubleJump = true
+        end
+        stopAllGroundAnims(0.05)
+
+        if velY < -1 then
+            if not isFalling then
+                isFalling = true
+                isInAir = false
+                jumpTrack:Stop(0.1)
+                if not fallTrack.IsPlaying then
+                    fallTrack:Play(0.1)
+                end
+            end
+        else
+            if not isInAir then
+                isInAir = true
+                isFalling = false
+                fallTrack:Stop(0.1)
+                if not jumpTrack.IsPlaying then
+                    jumpTrack:Play(0.1)
+                end
+            end
+        end
+        return
+    end
+
+    if isInAir or isFalling then
+        isInAir = false
+        isFalling = false
+        canDoubleJump = false
+        hasDoubleJumped = false
+        airTime = 0
+        jumpTrack:Stop(0.1)
+        fallTrack:Stop(0.1)
+    end
+
+    if isCrouching then
+        if isMoving then
+            if not crouchWalkTrack.IsPlaying then
+                stopAllGroundAnims(0.1)
+                crouchWalkTrack:Play(0.1)
+            end
+        else
+            if not crouchIdleTrack.IsPlaying then
+                stopAllGroundAnims(0.1)
+                crouchIdleTrack:Play(0.1)
+            end
+        end
+    else
+        if isMoving then
+            if not runTrack.IsPlaying then
+                stopAllGroundAnims(0.1)
+                runTrack:Play(0.1)
+            end
+        else
+            if not idleTrack.IsPlaying then
+                stopAllGroundAnims(0.1)
+                idleTrack:Play(0.1)
+            end
+        end
+    end
+end)
+table.insert(connections, heartbeatConn)
+
+local inputConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == Enum.KeyCode.Q then startSlide() end
+    if input.KeyCode == Enum.KeyCode.Space then doDoubleJump() end
+    if input.KeyCode == Enum.KeyCode.C then
+        if isCrouching then exitCrouch() else enterCrouch() end
+    end
+end)
+table.insert(connections, inputConn)
+
+local slideStopConn = slideTrack.Stopped:Connect(function()
+    if isSliding then stopSlide() end
+end)
+table.insert(connections, slideStopConn)
+
+local charAddedConn = player.CharacterAdded:Connect(function(newChar)
+    character = newChar
+    humanoid = newChar:WaitForChild("Humanoid")
+    animator = humanoid:WaitForChild("Animator")
+    rootPart = newChar:WaitForChild("HumanoidRootPart")
+    hrp = rootPart
+
+    humanoid.WalkSpeed = 40
+    humanoid.JumpPower = 60
+
+    local newAnimateScript = newChar:FindFirstChild("Animate")
+    if newAnimateScript then
+        newAnimateScript.Disabled = true
+    end
+
+    footstepSound = Instance.new("Sound")
+    footstepSound.Name = "CustomFootstepSound"
+    footstepSound.SoundId = "rbxassetid://REPLACE_WITH_YOUR_SOUND_ID"
+    footstepSound.Volume = 0.5
+    footstepSound.RollOffMaxDistance = 30
+    footstepSound.Parent = rootPart
+
+    idleTrack = animator:LoadAnimation(idleAnim)
+    idleTrack.Priority = Enum.AnimationPriority.Idle
+    idleTrack.Looped = true
+
+    runTrack = animator:LoadAnimation(runAnim)
+    runTrack.Priority = Enum.AnimationPriority.Movement
+    runTrack.Looped = true
+
+    jumpTrack = animator:LoadAnimation(jumpAnim)
+    jumpTrack.Priority = Enum.AnimationPriority.Action
+    jumpTrack.Looped = true
+
+    fallTrack = animator:LoadAnimation(fallAnim)
+    fallTrack.Priority = Enum.AnimationPriority.Action
+    fallTrack.Looped = true
+
+    doubleJumpTrack = animator:LoadAnimation(doubleJumpAnim)
+    doubleJumpTrack.Priority = Enum.AnimationPriority.Action2
+    doubleJumpTrack.Looped = false
+
+    crouchIdleTrack = animator:LoadAnimation(crouchIdleAnim)
+    crouchIdleTrack.Priority = Enum.AnimationPriority.Action
+    crouchIdleTrack.Looped = true
+
+    crouchWalkTrack = animator:LoadAnimation(crouchWalkAnim)
+    crouchWalkTrack.Priority = Enum.AnimationPriority.Action
+    crouchWalkTrack.Looped = true
+
+    slideTrack = animator:LoadAnimation(slideAnim)
+    slideTrack.Priority = Enum.AnimationPriority.Action
+    slideTrack:Play()
+    slideTrack:Stop()
+
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        track:Stop(0)
+    end
+    idleTrack:Play(0)
+
+    isSliding = false
+    isInAir = false
+    isFalling = false
+    isCrouching = false
+    canDoubleJump = false
+    hasDoubleJumped = false
+    airTime = 0
+end)
+table.insert(connections, charAddedConn)
+
+shared.CustomMovementConnections = connections
