@@ -1,0 +1,42 @@
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+local animator = humanoid:WaitForChild("Animator")
+
+local playingTracks = animator:GetPlayingAnimationTracks()
+local output = {}
+local foundAny = false
+
+table.insert(output, "==== Currently Playing Animations ====")
+
+for index, track in ipairs(playingTracks) do
+    local anim = track.Animation
+    if anim and anim.AnimationId ~= "" then
+        foundAny = true
+
+        local entry =
+            "Animation #" .. index .. "\n" ..
+            "Name: " .. anim.Name .. "\n" ..
+            "ID: " .. anim.AnimationId .. "\n" ..
+            "----------------------------------"
+
+        table.insert(output, entry)
+    end
+end
+
+if not foundAny then
+    table.insert(output, "No animations currently playing.")
+end
+
+local finalString = table.concat(output, "\n")
+
+print(finalString)
+
+if setclipboard then
+    setclipboard(finalString)
+    print("All animation data copied to clipboard.")
+else
+    warn("Clipboard function not available.")
+end
