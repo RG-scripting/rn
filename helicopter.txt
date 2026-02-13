@@ -1,0 +1,182 @@
+-- Helicopter Emote Controller for Executors (Xeno-friendly)
+-- LocalScript / Executor
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+if not player then return end
+
+-- ── SINGLE INSTANCE CHECK ───────────────────────────────────────────────
+if player:FindFirstChild("_HELI_CONTROLLER") then
+    local old = player:FindFirstChild("_HELI_CONTROLLER")
+    if old:FindFirstChild("Shutdown") then
+        old.Shutdown.Value = true
+    end
+    old:Destroy()
+    return
+end
+
+-- ── CREATE CONTROLLER OBJECT ───────────────────────────────────────────
+local Controller = Instance.new("Folder")
+Controller.Name = "_HELI_CONTROLLER"
+Controller.Parent = player
+
+local ShutdownFlag = Instance.new("BoolValue")
+ShutdownFlag.Name = "Shutdown"
+ShutdownFlag.Value = false
+ShutdownFlag.Parent = Controller
+
+-- ── CONSTANTS ─────────────────────────────────────────────────────────
+local HELICOPTER_ANIMATION_ID = "rbxassetid://139588459581211"
+
+local DEFAULT_WALK_SPEED = 16
+local DEFAULT_JUMP_POWER = 50
+local MIN_ALTITUDE       = 5
+
+local HELI = {
+    maxSpeed      = 50,
+    acceleration  = 2.0,
+    deceleration  = 0.95,
+    turnSpeed     = 3.0,
+    verticalSpeed = 30,
+}
+
+local TILT = {
+    maxPitch = math.rad(18),
+    maxRoll  = math.rad(12),
+    speed    = 6.0,
+}
+
+local GROUND_CHECK_DISTANCE = 4.0
+
+-- ── CHARACTER REFERENCES ──────────────────────────────────────────────
+local character        = player.Character or player.CharacterAdded:Wait()
+local humanoid         = character:WaitForChild("Humanoid")
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+
+-- ── RUNTIME STATE ─────────────────────────────────────────────────────
+local currentSpeed    = 0
+local currentRotation = 0
+local currentAltitude = humanoidRootPart.Position.Y
+local currentPitch    = 0
+local currentRoll     = 0
+
+local animationTrack  = nil
+local bodyVelocity    = nil
+local bodyGyro        = nil
+local bodyPosition    = nil
+local heartbeatConnection
+
+local keys = { W=false, A=false, S=false, D=false, Q=false, E=false }
+
+-- ── PHYSICS FUNCTIONS ─────────────────────────────────────────────────
+local function removePhysics()
+    if bodyVelocity then bodyVelocity:Destroy() bodyVelocity=nil end
+    if bodyGyro then bodyGyro:Destroy() bodyGyro=nil end
+    if bodyPosition then bodyPosition:Destroy() bodyPosition=nil end
+end
+
+local function shutdown()
+    if heartbeatConnection then
+        heartbeatConnection:Disconnect()
+        heartbeatConnection=nil
+    end
+    if animationTrack then
+        animationTrack:Stop()
+        animationTrack=nil
+    end
+    removePhysics()
+    if humanoid and humanoid.Health > 0 then
+        humanoid.WalkSpeed = DEFAULT_WALK_SPEED
+        humanoid.JumpPower = DEFAULT_JUMP_POWER
+    end
+    if Controller then Controller:Destroy() end
+end
+
+-- ── PHYSICS CREATION ──────────────────────────────────────────────────
+local function createPhysics()
+    bodyVelocity = Instance.new("BodyVelocity")
+    bodyVelocity.MaxForce = Vector3.new(1e5,0,1e5)
+    bodyVelocity.Parent = humanoidRootPart
+
+    bodyGyro = Instance.new("BodyGyro")
+    bodyGyro.MaxTorque = Vector3.new(5e4,1e5,5e4)
+    bodyGyro.P = 20000
+    bodyGyro.Parent = humanoidRootPart
+
+    bodyPosition = Instance.new("BodyPosition")
+    bodyPosition.MaxForce = Vector3.new(0,1e5,0)
+    bodyPosition.P = 5000
+    bodyPosition.Position = humanoidRootPart.Position
+    bodyPosition.Parent = humanoidRootPart
+end
+
+-- ── LOAD ANIMATION ─────────────────────────────────────────────────────
+local animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator", humanoid)
+local animation = Instance.new("Animation")
+animation.AnimationId = HELICOPTER_ANIMATION_ID
+animationTrack = animator:LoadAnimation(animation)
+animationTrack.Priority = Enum.AnimationPriority.Action
+animationTrack.Looped = true
+animationTrack:Play()
+
+-- ── ACTIVATE HELI ─────────────────────────────────────────────────────
+humanoid.WalkSpeed = 0
+humanoid.JumpPower = 0
+createPhysics()
+
+-- ── INPUT ─────────────────────────────────────────────────────────────
+UserInputService.InputBegan:Connect(function(input,gpe)
+    if gpe then return end
+    if keys[input.KeyCode.Name]~=nil then keys[input.KeyCode.Name]=true end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if keys[input.KeyCode.Name]~=nil then keys[input.KeyCode.Name]=false end
+end)
+
+-- ── GROUND CHECK ───────────────────────────────────────────────────────
+local function isGroundBelow()
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { character }
+    return workspace:Raycast(humanoidRootPart.Position, Vector3.new(0,-GROUND_CHECK_DISTANCE,0), params) ~= nil
+end
+
+-- ── HEARTBEAT LOOP ─────────────────────────────────────────────────────
+heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
+    if ShutdownFlag.Value then
+        shutdown()
+        return
+    end
+    if not bodyVelocity then return end
+
+    if keys.W then
+        currentSpeed = math.min(currentSpeed+HELI.acceleration,HELI.maxSpeed)
+    elseif keys.S then
+        currentSpeed = math.max(currentSpeed-HELI.acceleration,-HELI.maxSpeed*0.5)
+    else
+        currentSpeed*=HELI.deceleration
+        if math.abs(currentSpeed)<0.05 then currentSpeed=0 end
+    end
+
+    if keys.A then currentRotation+=HELI.turnSpeed*dt end
+    if keys.D then currentRotation-=HELI.turnSpeed*dt end
+
+    if keys.E then currentAltitude+=HELI.verticalSpeed*dt
+    elseif keys.Q then if not isGroundBelow() then currentAltitude-=HELI.verticalSpeed*dt end
+    end
+    currentAltitude = math.max(currentAltitude,MIN_ALTITUDE)
+
+    local targetPitch = -(currentSpeed/HELI.maxSpeed)*TILT.maxPitch
+    local rollInput = (keys.D and 1 or 0)-(keys.A and 1 or 0)
+    local targetRoll = rollInput*TILT.maxRoll
+    local lerp = math.min(TILT.speed*dt,1)
+    currentPitch+=(targetPitch-currentPitch)*lerp
+    currentRoll+=(targetRoll-currentRoll)*lerp
+
+    local yawCF = CFrame.new(humanoidRootPart.Position)*CFrame.Angles(0,currentRotation,0)
+    bodyGyro.CFrame = yawCF*CFrame.Angles(currentPitch,0,currentRoll)
+    bodyVelocity.Velocity = yawCF.LookVector*currentSpeed
+    bodyPosition.Position = Vector3.new(humanoidRootPart.Position.X,currentAltitude,humanoidRootPart.Position.Z)
+end)
