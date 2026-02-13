@@ -1,0 +1,283 @@
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local LP     = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+local EMOTE_ID  = "rbxassetid://114882698424429"
+local FLY_SPEED = 50
+local FLY_LERP  = 0.15
+local C_OUT     = Color3.fromRGB(90, 205, 255)
+local C_FILL    = Color3.fromRGB(15, 75, 200)
+
+local function removeHighlightFromChar(char)
+    if not char then return end
+    for _, v in ipairs(char:GetChildren()) do
+        if v:IsA("Highlight") and v.Name == "ZenHighlight" then
+            v:Destroy()
+        end
+    end
+end
+
+local function addHighlightToChar(char)
+    removeHighlightFromChar(char)
+    local hl = Instance.new("Highlight")
+    hl.Name                = "ZenHighlight"
+    hl.FillColor           = C_FILL
+    hl.FillTransparency    = 0.82
+    hl.OutlineColor        = C_OUT
+    hl.OutlineTransparency = 0
+    hl.DepthMode           = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.Adornee             = char
+    hl.Parent              = char
+end
+
+local function cleanupAllESP()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LP then
+            removeHighlightFromChar(player.Character)
+        end
+    end
+end
+
+if _G.ZenESP_Active then
+    _G.ZenESP_Active = false
+
+    if _G.ZenESP_Loop then
+        _G.ZenESP_Loop:Disconnect()
+        _G.ZenESP_Loop = nil
+    end
+
+    if _G.ZenESP_DeathConn then
+        _G.ZenESP_DeathConn:Disconnect()
+        _G.ZenESP_DeathConn = nil
+    end
+
+    if _G.ZenESP_RespawnConn then
+        _G.ZenESP_RespawnConn:Disconnect()
+        _G.ZenESP_RespawnConn = nil
+    end
+
+    if _G.ZenESP_PlayerAddedConn then
+        _G.ZenESP_PlayerAddedConn:Disconnect()
+        _G.ZenESP_PlayerAddedConn = nil
+    end
+
+    if _G.ZenESP_PlayerRemovingConn then
+        _G.ZenESP_PlayerRemovingConn:Disconnect()
+        _G.ZenESP_PlayerRemovingConn = nil
+    end
+
+    if _G.ZenESP_CharConns then
+        for _, conn in pairs(_G.ZenESP_CharConns) do
+            conn:Disconnect()
+        end
+        _G.ZenESP_CharConns = nil
+    end
+
+    if _G.ZenESP_EmoteTrack then
+        pcall(function() _G.ZenESP_EmoteTrack:Stop(0.4) end)
+        _G.ZenESP_EmoteTrack = nil
+    end
+
+    local char = LP.Character
+    if char then
+        local hum  = char:FindFirstChildOfClass("Humanoid")
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if hum then hum.PlatformStand = false end
+        if root then
+            local bg = root:FindFirstChild("ZenGyro")
+            local bv = root:FindFirstChild("ZenVelocity")
+            if bg then bg:Destroy() end
+            if bv then bv:Destroy() end
+        end
+    end
+
+    cleanupAllESP()
+    return
+end
+
+_G.ZenESP_Active    = true
+_G.ZenESP_CharConns = {}
+
+local smoothVel = Vector3.zero
+local curRoot, curGyro, curVel
+
+local function setupFlight(char)
+    local hum  = char:WaitForChild("Humanoid")
+    local root = char:WaitForChild("HumanoidRootPart")
+
+    hum.PlatformStand = true
+
+    local bg = Instance.new("BodyGyro")
+    bg.Name      = "ZenGyro"
+    bg.MaxTorque = Vector3.new(4e5, 4e5, 4e5)
+    bg.P         = 4e4
+    bg.D         = 900
+    bg.CFrame    = root.CFrame
+    bg.Parent    = root
+
+    local bv = Instance.new("BodyVelocity")
+    bv.Name     = "ZenVelocity"
+    bv.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+    bv.Velocity = Vector3.zero
+    bv.Parent   = root
+
+    curRoot = root
+    curGyro = bg
+    curVel  = bv
+end
+
+local function teardownFlight(char)
+    smoothVel = Vector3.zero
+    if not char then return end
+    local hum  = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if hum then hum.PlatformStand = false end
+    if root then
+        local bg = root:FindFirstChild("ZenGyro")
+        local bv = root:FindFirstChild("ZenVelocity")
+        if bg then bg:Destroy() end
+        if bv then bv:Destroy() end
+    end
+    curRoot = nil
+    curGyro = nil
+    curVel  = nil
+end
+
+local function playEmote(char)
+    if _G.ZenESP_EmoteTrack then
+        pcall(function() _G.ZenESP_EmoteTrack:Stop(0.2) end)
+        _G.ZenESP_EmoteTrack = nil
+    end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    local animator = hum:FindFirstChildOfClass("Animator") or hum:WaitForChild("Animator", 5)
+    if not animator then return end
+    local anim = Instance.new("Animation")
+    anim.AnimationId = EMOTE_ID
+    local track = animator:LoadAnimation(anim)
+    track.Priority = Enum.AnimationPriority.Action4
+    track.Looped   = true
+    track:Play(0.5)
+    _G.ZenESP_EmoteTrack = track
+end
+
+local function bindPlayerESP(player)
+    if player == LP then return end
+
+    if _G.ZenESP_CharConns[player] then
+        _G.ZenESP_CharConns[player]:Disconnect()
+    end
+
+    local function onChar(char)
+        removeHighlightFromChar(char)
+        task.wait(0.5)
+        if not _G.ZenESP_Active then return end
+        if not char or not char.Parent then return end
+        addHighlightToChar(char)
+
+        char.ChildAdded:Connect(function(child)
+            if not _G.ZenESP_Active then return end
+            if child:IsA("Humanoid") then
+                local hl = char:FindFirstChild("ZenHighlight")
+                if not hl then addHighlightToChar(char) end
+            end
+        end)
+    end
+
+    if player.Character then
+        onChar(player.Character)
+    end
+
+    _G.ZenESP_CharConns[player] = player.CharacterAdded:Connect(onChar)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    bindPlayerESP(p)
+end
+
+_G.ZenESP_PlayerAddedConn = Players.PlayerAdded:Connect(function(p)
+    if _G.ZenESP_Active then
+        bindPlayerESP(p)
+    end
+end)
+
+_G.ZenESP_PlayerRemovingConn = Players.PlayerRemoving:Connect(function(p)
+    if _G.ZenESP_CharConns and _G.ZenESP_CharConns[p] then
+        _G.ZenESP_CharConns[p]:Disconnect()
+        _G.ZenESP_CharConns[p] = nil
+    end
+    removeHighlightFromChar(p.Character)
+end)
+
+local function onLocalDied()
+    teardownFlight(LP.Character)
+    if _G.ZenESP_EmoteTrack then
+        pcall(function() _G.ZenESP_EmoteTrack:Stop(0.3) end)
+        _G.ZenESP_EmoteTrack = nil
+    end
+end
+
+local function onLocalRespawn(newChar)
+    if not _G.ZenESP_Active then return end
+
+    if _G.ZenESP_DeathConn then
+        _G.ZenESP_DeathConn:Disconnect()
+    end
+
+    smoothVel = Vector3.zero
+
+    local newHum = newChar:WaitForChild("Humanoid")
+    _G.ZenESP_DeathConn = newHum.Died:Connect(onLocalDied)
+
+    setupFlight(newChar)
+
+    task.wait(0.8)
+    if _G.ZenESP_Active then
+        pcall(playEmote, newChar)
+    end
+end
+
+local initChar = LP.Character or LP.CharacterAdded:Wait()
+local initHum  = initChar:WaitForChild("Humanoid")
+
+_G.ZenESP_DeathConn   = initHum.Died:Connect(onLocalDied)
+_G.ZenESP_RespawnConn = LP.CharacterAdded:Connect(onLocalRespawn)
+
+setupFlight(initChar)
+pcall(playEmote, initChar)
+
+_G.ZenESP_Loop = RunService.RenderStepped:Connect(function()
+    if not _G.ZenESP_Active then
+        _G.ZenESP_Loop:Disconnect()
+        return
+    end
+
+    if not curRoot or not curRoot.Parent or not curGyro or not curVel then return end
+
+    local look  = Camera.CFrame.LookVector
+    local flat  = Vector3.new(look.X, 0, look.Z)
+    if flat.Magnitude > 0.01 then flat = flat.Unit end
+
+    local right = Camera.CFrame.RightVector
+    local flatR = Vector3.new(right.X, 0, right.Z)
+    if flatR.Magnitude > 0.01 then flatR = flatR.Unit end
+
+    local dir = Vector3.zero
+    if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir += flat                end
+    if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir -= flat                end
+    if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir += flatR               end
+    if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir -= flatR               end
+    if UserInputService:IsKeyDown(Enum.KeyCode.E) then dir += Vector3.new(0,1,0)  end
+    if UserInputService:IsKeyDown(Enum.KeyCode.Q) then dir -= Vector3.new(0,1,0)  end
+
+    local desired = dir.Magnitude > 0.01 and dir.Unit * FLY_SPEED or Vector3.zero
+    smoothVel = smoothVel:Lerp(desired, FLY_LERP)
+    curVel.Velocity = smoothVel
+
+    if flat.Magnitude > 0.01 then
+        curGyro.CFrame = CFrame.lookAt(Vector3.zero, flat)
+    end
+end)
